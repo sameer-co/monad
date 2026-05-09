@@ -5,11 +5,24 @@ MON/USDC & MON/USDT RSI(40) x WMA(15) Crossover Trading Bot
 TP = 2.2x SL | Telegram alerts | Win/Loss tracker
 """
 
+import subprocess, sys
+
+def _install(pkg):
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", pkg],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+for _pkg in ("requests", "python-dotenv"):
+    try:
+        __import__(_pkg.replace("-", "_").split("[")[0])
+    except ImportError:
+        print(f"[bootstrap] installing {_pkg}...", flush=True)
+        _install(_pkg)
+
 import os
-import sys
 import time
 import json
-import math
 import logging
 import requests
 import threading
