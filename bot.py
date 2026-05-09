@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-MON Paper Trading Bot — RSI(40) × WMA(15) Crossover
-Data : CoinGecko free public API (no key needed)
-TF   : 3-minute synthetic candles (polled every 30s)
-Acct : 100 USDC paper | Commission 0.08% round-trip
-SL   : Below crossover candle low
-TP   : Entry + risk × 2.2
-Alert: Telegram on open & close
+MON/USDT Paper Trading Bot — RSI(40) × WMA(15) Crossover
+Exchange : OKX public REST API (no key needed)
+TF        : 3-minute real OHLCV candles
+Account   : 100 USDC paper | 0.08% round-trip commission
+SL        : Below crossover candle low | TP : risk × 2.2
+Alerts    : Telegram on open & close | Stats: stats.json
 """
 
-# ── Auto-install dependencies ─────────────────────────────────────────────────
+# ── Auto-install ───────────────────────────────────────────────────────────────
 import subprocess, sys
 
 def _install(pkg):
@@ -25,36 +24,35 @@ for _pkg in ("requests", "python-dotenv"):
         print(f"[bootstrap] installing {_pkg}...", flush=True)
         _install(_pkg)
 
-# ── Stdlib + third-party ──────────────────────────────────────────────────────
 import os, time, json, logging, threading
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import deque
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-ACCOUNT_BALANCE  = 100.0
-COMMISSION_RT    = 0.0008
-RSI_PERIOD       = 40
-WMA_PERIOD       = 15
-TP_MULTIPLIER    = 2.2
-CANDLE_SECONDS   = 180        # 3-minute candles
-POLL_SECONDS     = 30         # price poll interval
-MIN_CANDLES      = RSI_PERIOD + WMA_PERIOD + 10
-STATS_FILE       = Path("/app/stats.json")
-LOG_FILE         = Path("/app/bot.log")
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+ACCOUNT_BALANCE = 100.0
+COMMISSION_RT   = 0.0008
+RSI_PERIOD      = 40
+WMA_PERIOD      = 15
+TP_MULTIPLIER   = 2.2
+POLL_SECONDS    = 60          # poll every 60s (3m candle updates are smooth)
+MIN_CANDLES     = RSI_PERIOD + WMA_PERIOD + 5
 
-CG_COIN_ID       = "monad"
-CG_BASE          = "https://api.coingecko.com/api/v3"
+BASE_DIR   = Path(os.getenv("BOT_DIR", Path(__file__).parent))
+STATS_FILE = BASE_DIR / "stats.json"
+LOG_FILE   = BASE_DIR / "bot.log"
+
+OKX_BASE   = "https://www.okx.com"
+OKX_SYMBOL = "MON-USDT"
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg")
 TG_CHAT  = os.getenv("TG_CHAT_ID",   "1950462171")
 
-# ─── LOGGING ─────────────────────────────────────────────────────────────────
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+# ── LOGGING ───────────────────────────────────────────────────────────────────
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -65,7 +63,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("MON-BOT")
 
-# ─── STATS ───────────────────────────────────────────────────────────────────
+# ── STATS ─────────────────────────────────────────────────────────────────────
 def load_stats():
     if STATS_FILE.exists():
         try:
@@ -77,122 +75,82 @@ def load_stats():
 def save_stats(s):
     STATS_FILE.write_text(json.dumps(s, indent=2))
 
-# ─── TELEGRAM ────────────────────────────────────────────────────────────────
+# ── TELEGRAM ──────────────────────────────────────────────────────────────────
 def tg_send(msg):
     if not TG_TOKEN or not TG_CHAT:
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
         r = requests.post(
-            url,
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"},
             timeout=10,
         )
         if not r.ok:
-            log.warning(f"TG failed: {r.status_code} {r.text[:120]}")
+            log.warning(f"TG failed: {r.status_code} {r.text[:100]}")
     except Exception as e:
         log.warning(f"TG error: {e}")
 
-# ─── COINGECKO PRICE FEED ────────────────────────────────────────────────────
+# ── OKX DATA ──────────────────────────────────────────────────────────────────
 _sess = requests.Session()
-_sess.headers["User-Agent"] = "MON-PaperBot/1.0"
+_sess.headers.update({"User-Agent": "MON-PaperBot/2.0", "Accept": "application/json"})
 
-def fetch_price_usd():
+def fetch_candles(limit=200):
+    """
+    OKX /api/v5/market/candles
+    Returns: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    confirm='1' = candle closed. Returns oldest→newest.
+    """
     try:
         r = _sess.get(
-            f"{CG_BASE}/simple/price",
-            params={"ids": CG_COIN_ID, "vs_currencies": "usd"},
+            f"{OKX_BASE}/api/v5/market/candles",
+            params={"instId": OKX_SYMBOL, "bar": "3m", "limit": limit},
             timeout=10,
         )
         r.raise_for_status()
-        return float(r.json()[CG_COIN_ID]["usd"])
-    except Exception as e:
-        log.warning(f"Price fetch error: {e}")
-        return None
-
-def fetch_historical_candles():
-    """Pull 1 day of minute data from CoinGecko, resample to 3m candles."""
-    try:
-        r = _sess.get(
-            f"{CG_BASE}/coins/{CG_COIN_ID}/market_chart",
-            params={"vs_currency": "usd", "days": 1, "interval": "minutely"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        prices = r.json().get("prices", [])
-        if not prices:
+        raw = r.json()
+        if raw.get("code") != "0":
+            log.warning(f"OKX API error: {raw.get('msg')}")
             return []
-
         candles = []
-        bms = CANDLE_SECONDS * 1000
-        i = 0
-        while i < len(prices):
-            ts = prices[i][0]
-            bucket_start = (ts // bms) * bms
-            bp = []
-            while i < len(prices) and prices[i][0] < bucket_start + bms:
-                bp.append(prices[i][1])
-                i += 1
-            if bp:
-                candles.append({
-                    "ts":     bucket_start,
-                    "open":   bp[0],
-                    "high":   max(bp),
-                    "low":    min(bp),
-                    "close":  bp[-1],
-                    "closed": True,
-                })
-        if candles:
-            candles.pop()   # drop last (possibly incomplete) bucket
-        log.info(f"Warm-up: {len(candles)} historical 3m candles loaded")
+        for row in reversed(raw["data"]):   # newest-first → reverse to oldest-first
+            candles.append({
+                "ts":     int(row[0]),
+                "open":   float(row[1]),
+                "high":   float(row[2]),
+                "low":    float(row[3]),
+                "close":  float(row[4]),
+                "closed": row[8] == "1",
+            })
         return candles
     except Exception as e:
-        log.warning(f"Historical fetch error: {e}")
+        log.warning(f"OKX fetch error: {e}")
         return []
 
-# ─── CANDLE BUILDER ──────────────────────────────────────────────────────────
-class CandleBuilder:
-    def __init__(self):
-        self._o = self._h = self._l = self._c = self._ts = None
-        self._closed = deque(maxlen=300)
+def fetch_ticker():
+    try:
+        r = _sess.get(
+            f"{OKX_BASE}/api/v5/market/ticker",
+            params={"instId": OKX_SYMBOL},
+            timeout=8,
+        )
+        r.raise_for_status()
+        d = r.json()
+        if d.get("code") == "0":
+            return float(d["data"][0]["last"])
+    except Exception:
+        pass
+    return None
 
-    def _bucket(self, now_ms):
-        bms = CANDLE_SECONDS * 1000
-        return (now_ms // bms) * bms
+def test_connectivity():
+    """Returns True if OKX is reachable and MON-USDT exists."""
+    price = fetch_ticker()
+    if price:
+        log.info(f"OKX connected — MON/USDT = {price:.6f}")
+        return True
+    log.error("Cannot reach OKX API. Check your server location / firewall.")
+    return False
 
-    def push(self, price):
-        now_ms = int(time.time() * 1000)
-        bucket = self._bucket(now_ms)
-
-        if self._ts is None:
-            self._ts = bucket
-            self._o = self._h = self._l = self._c = price
-            return None
-
-        if bucket == self._ts:
-            self._h = max(self._h, price)
-            self._l = min(self._l, price)
-            self._c = price
-            return None
-
-        # Candle closed — seal it
-        closed = {"ts": self._ts, "open": self._o, "high": self._h,
-                  "low": self._l, "close": self._c, "closed": True}
-        self._closed.append(closed)
-        self._ts = bucket
-        self._o = self._h = self._l = self._c = price
-        return closed
-
-    def live_candle(self):
-        if self._ts is None:
-            return None
-        return {"ts": self._ts, "open": self._o, "high": self._h,
-                "low": self._l, "close": self._c, "closed": False}
-
-    def closed_candles(self):
-        return list(self._closed)
-
-# ─── INDICATORS ──────────────────────────────────────────────────────────────
+# ── INDICATORS ────────────────────────────────────────────────────────────────
 def calc_wma(closes, period):
     weights = list(range(1, period + 1))
     denom   = sum(weights)
@@ -222,8 +180,9 @@ def calc_rsi(closes, period):
         rsi.append(100.0 if al == 0 else 100 - 100 / (1 + ag / al))
     return rsi
 
-def detect_crossover(rsi, wma):
-    pairs = [(r, w) for r, w in zip(rsi, wma) if r is not None and w is not None]
+def detect_crossover(rsi_vals, wma_vals):
+    pairs = [(r, w) for r, w in zip(rsi_vals, wma_vals)
+             if r is not None and w is not None]
     if len(pairs) < 2:
         return None
     pr, pw = pairs[-2]
@@ -234,7 +193,7 @@ def detect_crossover(rsi, wma):
         return "bear"
     return None
 
-# ─── POSITION ────────────────────────────────────────────────────────────────
+# ── POSITION ──────────────────────────────────────────────────────────────────
 class Position:
     def __init__(self, entry, sl, tp, size_usdc):
         self.entry     = entry
@@ -249,39 +208,41 @@ class Position:
         return None
 
     def pnl(self, exit_price):
-        gross = (exit_price - self.entry) / self.entry * self.size_usdc
-        return gross - self.size_usdc * COMMISSION_RT
+        return (exit_price - self.entry) / self.entry * self.size_usdc \
+               - self.size_usdc * COMMISSION_RT
 
-# ─── BOT ─────────────────────────────────────────────────────────────────────
+# ── BOT ───────────────────────────────────────────────────────────────────────
 class TradingBot:
     def __init__(self):
-        self.stats    = load_stats()
-        self.position = None
-        self.builder  = CandleBuilder()
-        self._lock    = threading.Lock()
+        self.stats           = load_stats()
+        self.position        = None
+        self._lock           = threading.Lock()
         self._last_signal_ts = 0
-
-    def _warmup(self):
-        log.info("Fetching historical candles from CoinGecko...")
-        for c in fetch_historical_candles():
-            self.builder._closed.append(c)
 
     def run(self):
         log.info("=" * 60)
-        log.info("  MON PAPER BOT  |  RSI(40) x WMA(15)  |  3-minute TF")
-        log.info(f"  Paper account: {ACCOUNT_BALANCE} USDC  |  Feed: CoinGecko")
+        log.info("  MON/USDT PAPER BOT  |  RSI(40) x WMA(15)  |  3m TF")
+        log.info(f"  Paper: {ACCOUNT_BALANCE} USDC  |  Exchange: OKX (public API)")
         log.info("=" * 60)
 
-        self._warmup()
+        # ── connectivity check with retries ──────────────────────────────────
+        for attempt in range(1, 7):
+            if test_connectivity():
+                break
+            log.warning(f"Retry {attempt}/6 in 10s...")
+            time.sleep(10)
+        else:
+            tg_send("*MON Bot ERROR*: Cannot reach OKX. Check server location.")
+            sys.exit(1)
 
         tg_send(
             "*MON Paper Bot Started* \U0001f916\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"Strategy : RSI({RSI_PERIOD}) x WMA({WMA_PERIOD})\n"
+            "------------------------------------\n"
+            f"Strategy  : RSI({RSI_PERIOD}) x WMA({WMA_PERIOD})\n"
             f"Timeframe : 3-minute\n"
-            f"Account  : `{ACCOUNT_BALANCE} USDC` (paper)\n"
-            f"Feed     : CoinGecko / MON-USD\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"Symbol    : `{OKX_SYMBOL}` on OKX\n"
+            f"Account   : `{ACCOUNT_BALANCE} USDC` (paper)\n"
+            "------------------------------------\n"
             f"W:{self.stats['wins']} L:{self.stats['losses']} | "
             f"PnL: {self.stats['pnl_usdc']:+.2f} USDC"
         )
@@ -295,47 +256,59 @@ class TradingBot:
             time.sleep(POLL_SECONDS)
 
     def _tick(self):
-        price = fetch_price_usd()
-        if price is None:
+        candles = fetch_candles(limit=200)
+        if not candles:
+            log.warning("Empty candle response — skipping tick.")
             return
 
-        self.builder.push(price)
-        closed = self.builder.closed_candles()
-        live   = self.builder.live_candle()
+        # Split closed vs live
+        closed = [c for c in candles if c["closed"]]
+        live   = next((c for c in reversed(candles) if not c["closed"]), None)
+        # Fallback: if exchange marks all as closed, treat last as live
+        if not live and candles:
+            live = candles[-1]
+            closed = candles[:-1]
 
-        # Exit check on live candle
+        curr_price = live["close"] if live else (closed[-1]["close"] if closed else None)
+        if curr_price is None:
+            return
+
+        # ── Exit check on live candle ────────────────────────────────────────
         if self.position and live:
             result = self.position.check_exit(live)
             if result:
                 ep = self.position.sl if result == "SL" else self.position.tp
                 self._close_trade(result, ep)
 
+        # ── Need enough closed candles ───────────────────────────────────────
         if len(closed) < MIN_CANDLES:
-            log.info(
-                f"MON/USD={price:.6f} | Warming up "
-                f"{len(closed)}/{MIN_CANDLES} candles "
-                f"(~{(MIN_CANDLES - len(closed)) * 3} min left)"
-            )
+            log.info(f"MON={curr_price:.6f} | Warming up {len(closed)}/{MIN_CANDLES} candles")
             return
 
+        # ── Indicators ───────────────────────────────────────────────────────
         closes   = [c["close"] for c in closed]
         rsi_vals = calc_rsi(closes, RSI_PERIOD)
         wma_vals = calc_wma(closes, WMA_PERIOD)
+        rsi_now  = next((v for v in reversed(rsi_vals) if v is not None), None)
+        wma_now  = next((v for v in reversed(wma_vals) if v is not None), None)
 
-        rsi_now = next((v for v in reversed(rsi_vals) if v is not None), None)
-        wma_now = next((v for v in reversed(wma_vals) if v is not None), None)
-
-        if not self.position:
+        # ── Entry signal ─────────────────────────────────────────────────────
+        if not self.position and closed:
             last_c = closed[-1]
             if last_c["ts"] != self._last_signal_ts:
                 cross = detect_crossover(rsi_vals, wma_vals)
                 if cross == "bull":
                     self._last_signal_ts = last_c["ts"]
-                    self._open_trade(last_c, price)
+                    self._open_trade(last_c, curr_price)
 
-        pos_str = (f"IN TRADE entry={self.position.entry:.6f}" if self.position else "FLAT")
+        # ── Status log ───────────────────────────────────────────────────────
+        pos_str = (
+            f"IN TRADE  entry={self.position.entry:.6f}  "
+            f"SL={self.position.sl:.6f}  TP={self.position.tp:.6f}"
+            if self.position else "FLAT"
+        )
         log.info(
-            f"MON={price:.6f}  RSI={rsi_now:.2f}  WMA={wma_now:.6f}  "
+            f"MON={curr_price:.6f}  RSI={rsi_now:.2f}  WMA={wma_now:.6f}  "
             f"Candles={len(closed)}  {pos_str}"
         )
 
@@ -356,18 +329,23 @@ class TradingBot:
         comm   = size_usdc * COMMISSION_RT
         ts_str = self.position.opened_at.strftime("%Y-%m-%d %H:%M UTC")
 
-        log.info(f">>> LONG OPENED  entry={entry:.6f}  SL={sl:.6f}({sl_pct:.2f}%)  TP={tp:.6f}({tp_pct:.2f}%)  size={size_usdc:.2f}")
+        log.info(
+            f">>> LONG OPENED  entry={entry:.6f}  "
+            f"SL={sl:.6f}({sl_pct:.2f}%)  TP={tp:.6f}({tp_pct:.2f}%)  "
+            f"size={size_usdc:.2f} USDC"
+        )
         tg_send(
-            "*LONG OPENED* - MON/USD\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "*LONG OPENED* - MON/USDT\n"
+            "------------------------------------\n"
             f"Entry : `{entry:.6f}`\n"
             f"SL    : `{sl:.6f}` ({sl_pct:.2f}%)\n"
             f"TP    : `{tp:.6f}` ({tp_pct:.2f}%)\n"
             f"Size  : `{size_usdc:.2f} USDC` (paper)\n"
             f"Comm  : `{comm:.4f} USDC`\n"
             f"Time  : `{ts_str}`\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-            f"W:{self.stats['wins']} L:{self.stats['losses']} | PnL: {self.stats['pnl_usdc']:+.2f} USDC"
+            "------------------------------------\n"
+            f"W:{self.stats['wins']} L:{self.stats['losses']} | "
+            f"PnL: {self.stats['pnl_usdc']:+.2f} USDC"
         )
 
     def _close_trade(self, result, exit_price):
@@ -395,23 +373,23 @@ class TradingBot:
         emoji = "\u2705" if result == "TP" else "\u274c"
         log.info(
             f">>> TRADE CLOSED {result}  exit={exit_price:.6f}  pnl={pnl:+.4f}  "
-            f"W:{self.stats['wins']} L:{self.stats['losses']}  acc={acc:.1f}%  "
-            f"total={self.stats['pnl_usdc']:+.2f}"
+            f"W:{self.stats['wins']} L:{self.stats['losses']}  "
+            f"acc={acc:.1f}%  total={self.stats['pnl_usdc']:+.2f}"
         )
         tg_send(
-            f"{emoji} *TRADE CLOSED - {result}* MON/USD\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"{emoji} *TRADE CLOSED - {result}* MON/USDT\n"
+            "------------------------------------\n"
             f"Entry    : `{pos.entry:.6f}`\n"
             f"Exit     : `{exit_price:.6f}`\n"
             f"Duration : `{mins} min`\n"
             f"PnL      : `{pnl:+.4f} USDC`\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "------------------------------------\n"
             f"W:{self.stats['wins']} L:{self.stats['losses']} | Acc: {acc:.1f}%\n"
             f"Total PnL: `{self.stats['pnl_usdc']:+.2f} USDC`"
         )
         self.position = None
 
-# ─── ENTRY POINT ─────────────────────────────────────────────────────────────
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     bot = TradingBot()
     bot.run()
